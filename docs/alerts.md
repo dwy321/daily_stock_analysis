@@ -331,6 +331,25 @@ P6 不做：
 - 不做 sector 级集中度告警；P6 集中度使用 symbol 维度 `top_weight_pct`。
 - 不做跨规则同标的通知合并、分钟线、多市场时区精确判定或 legacy JSON 扩展。
 
+## 阶段感知与公开摘要联动（Refs #1386 P6）
+
+本节描述 #1386 P6 的告警可见性联动，区别于上面的“P6 持仓与自选股联动”。本联动不新增告警表、不做 migration、不自动触发轻量 LLM 分析，只把触发当时可公开的 phase/pack 摘要写入既有触发历史。
+
+- `AlertTriggerItem` 保留 `diagnostics` 字符串，并新增派生字段 `market_phase_summary`、`analysis_context_pack_overview`、`analysis_visibility_source`。
+- 真实 `status=triggered` 的 worker 记录会在 JSON diagnostics 中合并 sibling key `analysis_visibility`，包含 `market_phase_summary`、`analysis_context_pack_overview`、`source`。旧纯文本 diagnostics 保留原文，API 派生字段返回 `null`，source 返回 `legacy_text`。
+- `analysis_visibility_source` 取值为 `alert_trigger_market_context`、`analysis_history_snapshot`、`evaluator_snapshot`、`legacy_text` 或 `null`。
+- symbol 目标使用 `get_market_for_stock(normalize_stock_code(effective_target))` 构造触发时 phase；`target_scope=market` 直接用 `normalize_market_region(target)`，不会把 `cn|hk|us|jp|kr` 当作股票代码推断；账户级无法唯一定位市场时允许 summary 落为 `unknown`。
+- `analysis_context_pack_overview` 只来自 evaluator 已带 overview 或最近 30 天内的历史 snapshot。最近历史查询复用历史服务的代码变体候选，并以 best-effort + 批内短缓存方式执行；缺失或解析失败返回 `null`，不伪造 pack。
+- 告警通知只输出公开摘要：阶段标签、trigger source、partial-bar warning、数据质量等级和前两条 limitations。通知不得输出 raw context pack、Prompt、新闻正文、完整 diagnostics JSON、webhook URL、token 或持仓敏感细节。
+- Web 告警历史展示 phase badge、数据质量等级和 limitations 空态；旧触发记录缺少公开摘要时不影响列表读取。
+- #1390 P6 进一步复用 `DecisionSignal`：股票级真实触发会优先关联同标的 latest active 信号，并把低敏 `decision_signal_summary` 写入 diagnostics；无 active 信号时只创建最小 `source_type=alert/action=alert` 信号。`trace_id=alert-rule-<hash>` 只用于同源重试的 best-effort 幂等去重，不覆盖 active 信号；新建告警信号不写 `market_phase`，避免同一规则跨阶段重复创建。`market`、`portfolio_account`、overflow 或无法解析为具体股票的触发不会创建个股信号。
+
+DecisionSignal 字段、脱敏、迁移与回滚边界见 [DecisionSignal 决策信号专题](decision-signals.md)。
+
+#1386 P7 的用户边界：告警联动只解释触发时已经可公开的阶段和数据质量摘要，不会自动发起轻量 LLM 盘中分析，也不会新增告警表、规则类型、环境变量或 migration。需要阶段化分析时，仍应通过分析 API / Web 手动分析入口触发；告警通知只保留阶段标签、trigger source、partial-bar warning、数据质量等级和前两条 limitations。
+
+回滚本联动只需要 revert 对 worker/API/Web 的改动；已有 `diagnostics.analysis_visibility` 会作为普通 JSON diagnostics 保留，旧代码不会读取该 sibling key。
+
 ## P7 大盘红绿灯结构化告警
 
 P7 在现有 Alert API、Web 告警中心和 `src/services/alert_worker.py` 中新增 `target_scope=market`，消费结构化 `MarketLightSnapshot`，不解析 Markdown，不扩展 legacy `AGENT_EVENT_ALERT_RULES_JSON`，不新增表。大盘复盘历史仍写一条 `analysis_history(code=MARKET, report_type=market_review)`；多市场复盘通过 `context_snapshot.market_light_snapshots` 按 region 保存本次实际复盘的快照 map。
@@ -339,10 +358,10 @@ P7 在现有 Alert API、Web 告警中心和 `src/services/alert_worker.py` 中�
 
 | `target_scope` | `target` | 允许的 `alert_type` | 参数 | 触发语义 |
 | --- | --- | --- | --- | --- |
-| `market` | `cn` / `hk` / `us` | `market_light_status` | `statuses=["red","yellow"]`，只允许 `red/yellow`，默认 `["red","yellow"]` | 当前 `MarketLightSnapshot.status` 命中列表时触发 |
-| `market` | `cn` / `hk` / `us` | `market_light_score_drop` | `min_drop > 0` | `prev.score - current.score >= min_drop`，且 `prev.trade_date < current.trade_date` |
+| `market` | `cn` / `hk` / `us` / `jp` / `kr` | `market_light_status` | `statuses=["red","yellow"]`，只允许 `red/yellow`，默认 `["red","yellow"]` | 当前 `MarketLightSnapshot.status` 命中列表时触发 |
+| `market` | `cn` / `hk` / `us` / `jp` / `kr` | `market_light_score_drop` | `min_drop > 0` | `prev.score - current.score >= min_drop`，且 `prev.trade_date < current.trade_date` |
 
-scope/type 校验是双向约束：`target_scope=market` 只能使用两类 Market Light 规则；`market_light_*` 规则也只能使用 `target_scope=market`。`target` 会 `strip().lower()` 后严格限定为 `cn|hk|us`，非法 target 返回 HTTP 400 + `validation_error`。
+scope/type 校验是双向约束：`target_scope=market` 只能使用两类 Market Light 规则；`market_light_*` 规则也只能使用 `target_scope=market`。`target` 会 `strip().lower()` 后严格限定为 `cn|hk|us|jp|kr`，非法 target 返回 HTTP 400 + `validation_error`。
 
 ### `MarketLightSnapshot` 契约
 
@@ -372,6 +391,43 @@ scope/type 校验是双向约束：`target_scope=market` 只能使用两类 Mark
 - Web 告警中心新增 `market` scope、region 选择、两类 market rule 参数控件、类型筛选、region 展示和参数展示；API snake_case 映射使用 `statuses` 与 `min_drop`。
 - legacy `AGENT_EVENT_ALERT_RULES_JSON` 不支持 market 规则；P7 不更新 `.env.example`，因为没有新增配置项。
 - P7 不做指数跌幅、板块异动、涨跌停结构恶化、分钟线、多市场时区精确 quote as-of 解析，也不新增 DSL/规则引擎。
+
+## P8 用户配置与部署边界
+
+P8 不新增规则类型、API、表结构或 worker 行为；它把 P0-P7 已合并能力整理成面向用户和部署者的配置说明。告警 worker 只在 schedule 模式注册，核心开关仍是 `AGENT_EVENT_MONITOR_ENABLED`，轮询间隔仍是 `AGENT_EVENT_MONITOR_INTERVAL_MINUTES`。通知渠道继续走 alert 路由，详见 [通知配置](notifications.md) 中的 `NOTIFICATION_ALERT_CHANNELS` 与 `route_type=alert`。
+
+### 本地配置
+
+本地运行 `python main.py --schedule`、`python main.py --serve --schedule` 或等价内置调度模式时，设置 `AGENT_EVENT_MONITOR_ENABLED=true` 后会启动后台告警 worker；`AGENT_EVENT_MONITOR_INTERVAL_MINUTES` 控制轮询间隔。
+
+规则来源有两类：
+
+- Alert API / Web 告警中心持久化规则：推荐入口，支持 `single_symbol`、`watchlist`、`portfolio_holdings`、`portfolio_account`、`market`，覆盖实时价、涨跌幅、成交量、日线技术指标、持仓风险与大盘红绿灯规则。
+- legacy `AGENT_EVENT_ALERT_RULES_JSON`：只兼容 `single_symbol` 的 `price_cross`、`price_change_percent`、`volume_spike` 三类基础规则；不支持 P5 技术指标、P6 watchlist/portfolio 或 P7 market light。系统不会自动迁移、删除或改写 legacy JSON。
+
+### Docker
+
+仓库 `docker/Dockerfile` 默认命令是 `python main.py --schedule`，因此容器内只要配置 `AGENT_EVENT_MONITOR_ENABLED=true` 就会在 schedule 模式中启用告警 worker。Web/API 持久化规则依赖应用数据库；Docker 部署时需要保留 `data/` 数据库卷，避免容器重建后丢失规则、触发历史、通知尝试和冷却状态。legacy JSON 仍通过环境变量注入，不是 Docker 专用配置体系。
+
+### GitHub Actions
+
+仓库自带 `.github/workflows/00-daily-analysis.yml` 是一次性分析 workflow，实际调用 `python main.py`、`python main.py --market-review` 或 `python main.py --no-market-review`，不运行 `--schedule` 后台 alert worker，也没有映射 `AGENT_EVENT_*` 变量。仅在 repository Secrets / Variables 中新增 `AGENT_EVENT_MONITOR_ENABLED` 或 `AGENT_EVENT_ALERT_RULES_JSON` 不会让默认 Actions 开始持续轮询告警。
+
+如需 GitHub Actions 里的告警轮询，需要后续单独 PR 明确 schedule 启动方式、env 映射、规则来源和持久化数据库策略；P8 不改变现有 workflow。
+
+### Web 与 Desktop
+
+Web 告警中心 `/alerts` 是持久化规则的主要入口：可以创建、启停、删除规则，执行一次性 dry-run 测试，查看触发历史、通知尝试和只读冷却状态。批量规则的列表冷却状态是父规则摘要，子目标是否冷却以触发历史中的 `target` / `effective_target` 为准。
+
+Desktop 不新增原生告警管理界面；桌面用户复用内置或外部 WebUI 的 `/alerts` 页面。Desktop 回滚不需要清理额外状态。
+
+### 状态、通知与回滚
+
+worker 会把 `triggered`、`skipped`、`degraded`、`failed` 写入 `alert_triggers` 作为评估历史；正常未触发不写历史。`skipped` 表示规则本轮没有可评估条件，例如 market 非交易日或缺少上一交易日基线；`degraded` 表示数据源、持仓快照、历史快照或解析过程出现异常，结果不可用于触发通知。
+
+真实触发后会写入 `alert_notifications` 和 `alert_cooldowns`；DB 持久化规则按 `rule_id + target + data_source + data_timestamp` 对同一数据点做 best-effort 去重。legacy JSON 规则继续只使用进程内 fingerprint，不写持久化冷却。
+
+回滚 P8 只需 revert 文档、配置说明和 Web 文案改动；没有数据库迁移或用户数据清理。回滚早期 Phase 时，已创建的持久化规则不会自动删除，按下方 Phase 回滚说明处理。
 
 ## Phase 边界
 

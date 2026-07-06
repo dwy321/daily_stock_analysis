@@ -5,7 +5,7 @@
 ===================================
 
 职责：
-1. 按市场（A股/港股/美股）判断当日是否为交易日
+1. 按市场（A股/港股/美股/日股/韩股/台股）判断当日是否为交易日
 2. 按市场时区取“今日”日期，避免服务器 UTC 导致日期错误
 3. 支持 per-stock 过滤：只分析当日开市市场的股票
 4. 提供 regular-session 市场阶段推断基线，不改变现有分析入口行为
@@ -14,12 +14,15 @@
 """
 
 import logging
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from enum import Enum
-from typing import Any, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+from src.services.market_symbol_utils import get_suffix_market
 
 logger = logging.getLogger(__name__)
 
@@ -35,19 +38,39 @@ except ImportError:
     )
 
 # Market -> exchange code (exchange-calendars)
-MARKET_EXCHANGE = {"cn": "XSHG", "hk": "XHKG", "us": "XNYS"}
+MARKET_EXCHANGE = {"cn": "XSHG", "hk": "XHKG", "us": "XNYS", "jp": "XTKS", "kr": "XKRX", "tw": "XTAI"}
 
 # Market -> IANA timezone for "today"
 MARKET_TIMEZONE = {
     "cn": "Asia/Shanghai",
     "hk": "Asia/Hong_Kong",
     "us": "America/New_York",
+    "jp": "Asia/Tokyo",
+    "kr": "Asia/Seoul",
+    "tw": "Asia/Taipei",
 }
 
 # P0 market phase baseline (Issue #1386). This is an intentionally small
 # regular-session inference layer; it does not change existing fail-open
 # trading-day filtering or effective-date behavior.
-_CLOSING_AUCTION_WINDOW_MINUTES = {"cn": 3, "hk": 10, "us": 5}
+# tw: TWSE/TPEx run a 13:25-13:30 closing call auction (5 min). JP/KR use
+# regular-session closing auction windows before the 15:30 close (JP 5 min,
+# KR 10 min). Without an entry here .get(market, 0) yields a zero-width
+# window, so the last regular-session minutes stay INTRADAY until POSTMARKET.
+_CLOSING_AUCTION_WINDOW_MINUTES = {
+    "cn": 3,
+    "hk": 10,
+    "us": 5,
+    "jp": 5,
+    "kr": 10,
+    "tw": 5,
+}
+_SUPPORTED_ANALYSIS_PHASES = {
+    "auto",
+    "premarket",
+    "intraday",
+    "postmarket",
+}
 
 
 class MarketPhase(str, Enum):
@@ -62,12 +85,49 @@ class MarketPhase(str, Enum):
     UNKNOWN = "unknown"
 
 
+@dataclass
+class MarketPhaseContext:
+    """Runtime market-phase context for stock analysis plumbing."""
+
+    market: Optional[str]
+    phase: MarketPhase
+    market_local_time: datetime
+    session_date: date
+    effective_daily_bar_date: date
+    is_trading_day: Optional[bool]
+    is_market_open_now: Optional[bool]
+    is_partial_bar: Optional[bool]
+    minutes_to_open: Optional[int] = None
+    minutes_to_close: Optional[int] = None
+    trigger_source: str = "system"
+    analysis_intent: str = "auto"
+    warnings: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-safe representation for runtime context passing."""
+        return {
+            "market": self.market,
+            "phase": self.phase.value,
+            "market_local_time": self.market_local_time.isoformat(),
+            "session_date": self.session_date.isoformat(),
+            "effective_daily_bar_date": self.effective_daily_bar_date.isoformat(),
+            "is_trading_day": self.is_trading_day,
+            "is_market_open_now": self.is_market_open_now,
+            "is_partial_bar": self.is_partial_bar,
+            "minutes_to_open": self.minutes_to_open,
+            "minutes_to_close": self.minutes_to_close,
+            "trigger_source": self.trigger_source,
+            "analysis_intent": self.analysis_intent,
+            "warnings": list(self.warnings),
+        }
+
+
 def get_market_for_stock(code: str) -> Optional[str]:
     """
     Infer market region for a stock code.
 
     Returns:
-        'cn' | 'hk' | 'us' | None (None = unrecognized, fail-open: treat as open)
+        'cn' | 'hk' | 'us' | 'jp' | 'kr' | 'tw' | None (None = unrecognized, fail-open: treat as open)
     """
     if not code or not isinstance(code, str):
         return None
@@ -79,6 +139,9 @@ def get_market_for_stock(code: str) -> Optional[str]:
         return "us"
     if is_hk_stock_code(code):
         return "hk"
+    suffix_market = get_suffix_market(code)
+    if suffix_market:
+        return suffix_market
     # A-share: 6-digit numeric
     if code.isdigit() and len(code) == 6:
         return "cn"
@@ -292,15 +355,185 @@ def infer_market_phase(
         return MarketPhase.UNKNOWN
 
 
+def _add_warning_code(warnings: List[str], code: str) -> None:
+    if code not in warnings:
+        warnings.append(code)
+
+
+def _phase_booleans(
+    phase: MarketPhase,
+) -> Tuple[Optional[bool], Optional[bool], Optional[bool]]:
+    if phase == MarketPhase.UNKNOWN:
+        return None, None, None
+
+    is_trading_day = phase != MarketPhase.NON_TRADING
+    is_market_open_now = phase in {
+        MarketPhase.INTRADAY,
+        MarketPhase.CLOSING_AUCTION,
+    }
+    is_partial_bar = phase in {
+        MarketPhase.INTRADAY,
+        MarketPhase.LUNCH_BREAK,
+        MarketPhase.CLOSING_AUCTION,
+    }
+    return is_trading_day, is_market_open_now, is_partial_bar
+
+
+def _session_open_close_for_today(
+    market: str,
+    market_now: datetime,
+) -> Tuple[Optional[datetime], Optional[datetime]]:
+    ex = MARKET_EXCHANGE.get(market)
+    tz_name = MARKET_TIMEZONE.get(market)
+    if not ex or not tz_name or not _XCALS_AVAILABLE:
+        return None, None
+
+    cal = xcals.get_calendar(ex)
+    local_date = market_now.date()
+    if not cal.is_session(local_date):
+        return None, None
+
+    session = cal.date_to_session(local_date, direction="previous")
+    return (
+        _as_market_datetime(cal.session_open(session), tz_name),
+        _as_market_datetime(cal.session_close(session), tz_name),
+    )
+
+
+def _phase_minutes(
+    market: Optional[str],
+    market_now: datetime,
+    phase: MarketPhase,
+) -> Tuple[Optional[int], Optional[int], bool]:
+    if (
+        market not in MARKET_EXCHANGE
+        or phase in {MarketPhase.UNKNOWN, MarketPhase.NON_TRADING, MarketPhase.POSTMARKET}
+    ):
+        return None, None, False
+    if not _XCALS_AVAILABLE:
+        return None, None, False
+
+    try:
+        session_open, session_close = _session_open_close_for_today(market, market_now)
+    except Exception as e:
+        logger.warning("trading_calendar.market_phase_context calendar_error: %s", e)
+        return None, None, True
+
+    if session_open is None or session_close is None:
+        return None, None, False
+
+    if phase == MarketPhase.PREMARKET and market_now < session_open:
+        seconds = (session_open - market_now).total_seconds()
+        return max(0, int(seconds // 60)), None, False
+
+    if phase in {
+        MarketPhase.INTRADAY,
+        MarketPhase.LUNCH_BREAK,
+        MarketPhase.CLOSING_AUCTION,
+    } and market_now < session_close:
+        seconds = (session_close - market_now).total_seconds()
+        return None, max(0, int(seconds // 60)), False
+
+    return None, None, False
+
+
+def _normalize_analysis_phase(
+    analysis_phase: Optional[str],
+    analysis_intent: Optional[str],
+) -> str:
+    def _coerce(value: Optional[str]) -> str:
+        if isinstance(value, MarketPhase):
+            return value.value
+        return str(value or "").strip().lower()
+
+    requested = _coerce(analysis_phase) or "auto"
+    legacy_intent = _coerce(analysis_intent)
+    if requested == "auto" and legacy_intent and legacy_intent != "auto":
+        requested = legacy_intent
+    if requested not in _SUPPORTED_ANALYSIS_PHASES:
+        raise ValueError(
+            f"invalid analysis_phase: {requested}. "
+            f"Must be one of {sorted(_SUPPORTED_ANALYSIS_PHASES)}"
+        )
+    return requested
+
+
+def build_market_phase_context(
+    *,
+    market: Optional[str],
+    current_time: Optional[datetime] = None,
+    trigger_source: str = "system",
+    analysis_intent: str = "auto",
+    analysis_phase: str = "auto",
+) -> MarketPhaseContext:
+    """
+    Build a JSON-safe runtime market-phase context for analysis plumbing.
+
+    ``analysis_phase="auto"`` keeps calendar inference. Explicit supported
+    phases override only the phase and derived flags/minute fields; they do
+    not rewrite market-local time or the effective daily-bar date. The legacy
+    ``analysis_intent`` argument remains a compatibility alias when
+    ``analysis_phase`` is left as ``auto``.
+    """
+    requested_phase = _normalize_analysis_phase(analysis_phase, analysis_intent)
+    market_now = get_market_now(market, current_time=current_time)
+    warnings: List[str] = []
+
+    if market not in MARKET_EXCHANGE or market not in MARKET_TIMEZONE:
+        phase = MarketPhase.UNKNOWN
+        _add_warning_code(warnings, "unknown_market")
+    else:
+        if not _XCALS_AVAILABLE:
+            _add_warning_code(warnings, "calendar_unavailable")
+        if requested_phase == "auto":
+            phase = infer_market_phase(market, current_time=current_time)
+            if phase == MarketPhase.UNKNOWN and _XCALS_AVAILABLE:
+                _add_warning_code(warnings, "calendar_error")
+        else:
+            phase = MarketPhase(requested_phase)
+
+    if requested_phase != "auto" and phase == MarketPhase.UNKNOWN:
+        phase = MarketPhase(requested_phase)
+
+    effective_daily_bar_date = get_effective_trading_date(
+        market,
+        current_time=current_time,
+    )
+    is_trading_day, is_market_open_now, is_partial_bar = _phase_booleans(phase)
+    minutes_to_open, minutes_to_close, minutes_calendar_error = _phase_minutes(
+        market,
+        market_now,
+        phase,
+    )
+    if minutes_calendar_error:
+        _add_warning_code(warnings, "calendar_error")
+
+    return MarketPhaseContext(
+        market=market,
+        phase=phase,
+        market_local_time=market_now,
+        session_date=market_now.date(),
+        effective_daily_bar_date=effective_daily_bar_date,
+        is_trading_day=is_trading_day,
+        is_market_open_now=is_market_open_now,
+        is_partial_bar=is_partial_bar,
+        minutes_to_open=minutes_to_open,
+        minutes_to_close=minutes_to_close,
+        trigger_source=trigger_source or "system",
+        analysis_intent=requested_phase,
+        warnings=warnings,
+    )
+
+
 def get_open_markets_today() -> Set[str]:
     """
     Get markets that are open today (by each market's local timezone).
 
     Returns:
-        Set of market keys ('cn', 'hk', 'us') that are trading today
+        Set of market keys that are trading today
     """
     if not _XCALS_AVAILABLE:
-        return {"cn", "hk", "us"}
+        return set(MARKET_TIMEZONE)
     result: Set[str] = set()
     for mkt, tz_name in MARKET_TIMEZONE.items():
         try:
@@ -321,22 +554,44 @@ def compute_effective_region(
     Compute effective market review region given config and open markets.
 
     Args:
-        config_region: From MARKET_REVIEW_REGION ('cn' | 'hk' | 'us' | 'both')
+        config_region: From MARKET_REVIEW_REGION ('cn' | 'hk' | 'us' | 'jp' | 'kr' | 'both' or comma subset)
         open_markets: Markets open today
 
     Returns:
         None: caller uses config default (check disabled)
         '': all relevant markets closed, skip market review
-        'cn' | 'hk' | 'us' | 'both': effective subset for today
+        'cn' | 'hk' | 'us' | 'jp' | 'kr' | 'both': effective subset for today
     """
-    if config_region not in ("cn", "hk", "us", "both"):
-        config_region = "cn"
-    if config_region in ("cn", "hk", "us"):
-        return config_region if config_region in open_markets else ""
-    # both: return only the markets that are actually open today
-    parts = [m for m in ("cn", "hk", "us") if m in open_markets]
-    if not parts:
+    markets = ("cn", "hk", "us", "jp", "kr")
+    normalized = (config_region or "cn").strip().lower()
+    if not normalized:
+        normalized = "cn"
+
+    requested = {
+        item.strip() for item in normalized.split(",") if item.strip()
+    }
+    if not requested:
+        requested = {"cn"}
+
+    if "both" in requested:
+        requested = set(markets)
+    else:
+        # Ignore invalid tokens and only keep known markets.
+        requested = {item for item in requested if item in markets}
+
+    if not requested:
+        # No valid market token left after filtering; follow parser fallback behavior.
+        requested = {"cn"}
+
+    # single explicit region: keep single-region return semantics (empty when closed)
+    if len(requested) == 1:
+        region = next(iter(requested))
+        return region if region in open_markets else ""
+
+    # multi-region subset: keep only markets open today, in canonical order
+    open_selected = [m for m in markets if m in requested and m in open_markets]
+    if not open_selected:
         return ""
-    if len(parts) == 1:
-        return parts[0]
-    return ",".join(parts)
+    if len(open_selected) == 1:
+        return open_selected[0]
+    return ",".join(open_selected)
